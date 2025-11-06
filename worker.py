@@ -1,112 +1,107 @@
-# ------------------ Health server p/ Render (porta obrigatória) ------------------
-import os, threading
+# worker.py
+import os
+import ssl
+import json
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
 
+import paho.mqtt.client as mqtt
+from supabase import create_client, Client
+
+# ---------------- Health server (porta para o Render) ----------------
 def start_health_server():
     port = int(os.environ.get("PORT", "10000"))  # Render injeta PORT
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in ("/", "/health"):
                 self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(b"ok")
             else:
-                self.send_response(404)
-                self.end_headers()
-
-        # silencia logs do HTTP
-        def log_message(self, *args, **kwargs):
+                self.send_response(404); self.end_headers()
+        def log_message(self, *args):  # silencia log HTTP
             return
-
     httpd = HTTPServer(("", port), Handler)
     httpd.serve_forever()
 
-# ------------------ Dependências principais ------------------
-import paho.mqtt.client as mqtt
-from datetime import datetime, timezone
-from supabase import create_client, Client
+# Inicia o /health em background
+threading.Thread(target=start_health_server, daemon=True).start()
 
-# ------------------ Variáveis de ambiente ------------------
+# ---------------- Ambiente ----------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-BROKER   = os.environ.get("MQTT_BROKER")
-PORT     = int(os.environ.get("MQTT_PORT", "8883"))
-USER     = os.environ.get("MQTT_USER") or ""
-PASSWORD = os.environ.get("MQTT_PASS") or ""
+MQTT_HOST = os.environ.get("MQTT_BROKER")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
 
 TOPIC_TEMP = "placa1/temperatura"
 TOPIC_UMID = "placa1/umidade"
-DEVICE_ID  = "placa1"
 
-# ------------------ Inicializa Supabase ------------------
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL e/ou SUPABASE_SERVICE_KEY não definidos nas env vars.")
+# ---------------- Supabase ----------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def salvar_leitura(device_id: str, temperatura: float, umidade: float):
-    data = {
+def salvar_leitura(device_id, temperatura, umidade):
+    payload = {
         "device_id": device_id,
-        "ts": datetime.now(timezone.utc).isoformat(),  # ISO8601 em UTC
+        "ts": datetime.now(timezone.utc).isoformat(),
         "temperature_c": float(temperatura),
         "humidity_pct": float(umidade),
     }
-    supabase.table("readings").insert(data).execute()
-    print(f"✔️ Dados salvos: {data}")
+    try:
+        supabase.table("readings").insert(payload).execute()
+        print(f"[OK] salvo -> {payload}")
+    except Exception as e:
+        # Não deixa o processo morrer por erro transitório de rede/DB
+        print(f"[ERRO] insert supabase: {e}")
 
-# ------------------ MQTT callbacks ------------------
+# ---------------- MQTT ----------------
 leituras = {"temperatura": None, "umidade": None}
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("Conectado ao broker MQTT com código:", rc)
-    # (re)assina os tópicos sempre que reconectar
-    client.subscribe(TOPIC_TEMP, qos=0)
-    client.subscribe(TOPIC_UMID, qos=0)
+    print(f"[MQTT] conectado rc={rc}")
+    client.subscribe(TOPIC_TEMP)
+    client.subscribe(TOPIC_UMID)
+
+def on_disconnect(client, userdata, rc, properties=None):
+    print(f"[MQTT] desconectado rc={rc} (Render dormiu? rede caiu?)")
 
 def on_message(client, userdata, msg):
     global leituras
-    payload = msg.payload.decode().strip()
     try:
-        val = float(payload)
-    except ValueError:
-        print(f"⚠️ Payload inválido em {msg.topic}: {payload!r}")
-        return
+        v = msg.payload.decode().strip()
+        if msg.topic.endswith("temperatura"):
+            leituras["temperatura"] = v
+        elif msg.topic.endswith("umidade"):
+            leituras["umidade"] = v
+        # quando tiver os dois, grava e zera
+        if leituras["temperatura"] is not None and leituras["umidade"] is not None:
+            salvar_leitura("placa1", leituras["temperatura"], leituras["umidade"])
+            leituras = {"temperatura": None, "umidade": None}
+    except Exception as e:
+        print(f"[ERRO] on_message: {e}")
 
-    if msg.topic.endswith("temperatura"):
-        leituras["temperatura"] = val
-    elif msg.topic.endswith("umidade"):
-        leituras["umidade"] = val
+client = mqtt.Client(protocol=mqtt.MQTTv311)
+client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-    if (leituras["temperatura"] is not None) and (leituras["umidade"] is not None):
-        try:
-            salvar_leitura(DEVICE_ID, leituras["temperatura"], leituras["umidade"])
-        finally:
-            # limpa para esperar o próximo par temp/umid
-            leituras["temperatura"] = None
-            leituras["umidade"] = None
-
-# ------------------ Configura e inicia MQTT ------------------
-client = mqtt.Client()  # vai funcionar com paho 1.x e 2.x (apenas um aviso de depreciação pode aparecer)
-
-# autenticação (se houver)
-if USER or PASSWORD:
-    client.username_pw_set(USER, PASSWORD)
-
-# TLS só se estiver usando 8883
-if PORT == 8883:
-    # usa CAs do sistema; se precisar, pode carregar um CA específico com client.tls_set(ca_certs="...")
-    client.tls_set()
+# TLS se porta 8883
+if MQTT_PORT == 8883:
+    client.tls_set(cert_reqs=ssl.CERT_NONE)
+    client.tls_insecure_set(True)  # para testes; valide cert em produção
 
 client.on_connect = on_connect
+client.on_disconnect = on_disconnect
 client.on_message = on_message
 
-# reconexão automática (exponencial) e primeira conexão com retry
-client.reconnect_delay_set(min_delay=2, max_delay=30)
-client.connect(BROKER, PORT, keepalive=60)
+# Reconexão exponencial
+client.reconnect_delay_set(min_delay=5, max_delay=60)
 
-# ------------------ Sobe o health server e entra no loop MQTT ------------------
-threading.Thread(target=start_health_server, daemon=True).start()
+# keepalive ajuda o broker a detectar sessão quebrada
+print("[MQTT] conectando...")
+client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
 
-# loop bloqueante que tenta reconectar se cair
+# Loop que tenta reconectar sozinho se a primeira falhar
 client.loop_forever(retry_first_connection=True)
